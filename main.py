@@ -59,33 +59,39 @@ logger.addHandler(MongoLogHandler())
 # ==========================================
 
 async def safe_send_message(bot, chat_id: int, text: str, parse_mode=ParseMode.HTML, reply_markup=None):
-    """Sends HTML message safely; if <tg-emoji> fails on standard bot, strips it and retries."""
+    """Sends HTML message safely; if <tg-emoji> or entity parsing fails, strips tags and retries."""
     try:
         return await bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode, reply_markup=reply_markup)
     except Exception as e:
         err_str = str(e).lower()
-        if "custom_emoji" in err_str or "entity" in err_str or "can't parse entities" in err_str:
+        if any(term in err_str for term in ["custom_emoji", "entity", "can't parse entities", "parse"]):
             clean_text = re.sub(r'</?tg-emoji[^>]*>', '', text)
             try:
                 return await bot.send_message(chat_id=chat_id, text=clean_text, parse_mode=parse_mode, reply_markup=reply_markup)
             except Exception:
                 plain_text = re.sub(r'<[^>]+>', '', clean_text)
-                return await bot.send_message(chat_id=chat_id, text=plain_text, reply_markup=reply_markup)
+                try:
+                    return await bot.send_message(chat_id=chat_id, text=plain_text, parse_mode=parse_mode, reply_markup=reply_markup)
+                except Exception:
+                    return await bot.send_message(chat_id=chat_id, text=plain_text)
         raise
 
 async def safe_edit_message(message, text: str, parse_mode=ParseMode.HTML, reply_markup=None):
-    """Edits message safely; falls back to stripping <tg-emoji> or plain text."""
+    """Edits message safely; falls back to stripping <tg-emoji> or plain text on entity parse failure."""
     try:
         return await message.edit_text(text=text, parse_mode=parse_mode, reply_markup=reply_markup)
     except Exception as e:
         err_str = str(e).lower()
-        if "custom_emoji" in err_str or "entity" in err_str or "can't parse entities" in err_str:
+        if any(term in err_str for term in ["custom_emoji", "entity", "can't parse entities", "parse"]):
             clean_text = re.sub(r'</?tg-emoji[^>]*>', '', text)
             try:
                 return await message.edit_text(text=clean_text, parse_mode=parse_mode, reply_markup=reply_markup)
             except Exception:
                 plain_text = re.sub(r'<[^>]+>', '', clean_text)
-                return await message.edit_text(text=plain_text, reply_markup=reply_markup)
+                try:
+                    return await message.edit_text(text=plain_text, parse_mode=parse_mode, reply_markup=reply_markup)
+                except Exception:
+                    return await message.edit_text(text=plain_text)
         raise
 
 # ==========================================
@@ -433,8 +439,8 @@ def auto_learn_emojis(message: Message, bot_data: dict) -> int:
         if not char or not eid:
             return
         eid_str = str(eid).strip()
-        char_clean = char.strip()
-        if not char_clean or not eid_str:
+        char_clean = str(char).strip()
+        if not char_clean or not eid_str or not eid_str.isdigit():
             return
         base_char = char_clean.replace("\ufe0f", "")
         variant_char = base_char + "\ufe0f"
@@ -452,8 +458,9 @@ def auto_learn_emojis(message: Message, bot_data: dict) -> int:
                     utf16_bytes = text.encode("utf-16le")
                     start = entity.offset * 2
                     end = (entity.offset + entity.length) * 2
-                    emoji_char = utf16_bytes[start:end].decode("utf-16le", errors="ignore").strip()
-                    add_learned_emoji(emoji_char or "✨", entity.custom_emoji_id)
+                    if start < len(utf16_bytes) and end <= len(utf16_bytes):
+                        emoji_char = utf16_bytes[start:end].decode("utf-16le", errors="ignore").strip()
+                        add_learned_emoji(emoji_char or "✨", entity.custom_emoji_id)
                 except Exception as e:
                     logger.error("Error extracting custom emoji entity: %s", e)
 
@@ -482,7 +489,7 @@ def auto_learn_emojis(message: Message, bot_data: dict) -> int:
     return new_added
 
 def apply_premium_emojis(text: str, premium_emojis: dict = None) -> str:
-    """Replaces Unicode emojis with <tg-emoji emoji-id="..."> tags where supported, fetching IDs dynamically from saved emojis."""
+    """Replaces Unicode emojis with <tg-emoji emoji-id="..."> tags where supported, protecting existing tags & preventing nested tags."""
     if not text or not isinstance(text, str):
         return text or ""
 
@@ -496,10 +503,13 @@ def apply_premium_emojis(text: str, premium_emojis: dict = None) -> str:
         placeholders[key] = m.group(0)
         return key
 
-    # 1. Protect existing HTML tags and entities so we never replace inside tags or attributes
-    protected = re.sub(r'<[^>]+>', save_tag, text)
+    # 1. Protect existing full <tg-emoji ...>...</tg-emoji> blocks first so inner content is untouched
+    protected = re.sub(r'<tg-emoji[^>]*>.*?</tg-emoji>', save_tag, text, flags=re.DOTALL)
 
-    # 2. Build unique mapping from base emoji char to ID (saved emojis take highest precedence)
+    # 2. Protect any remaining HTML tags (like <b>, <i>, <code>, <a>, etc.)
+    protected = re.sub(r'<[^>]+>', save_tag, protected)
+
+    # 3. Build unique mapping from base emoji char to ID (saved emojis take highest precedence)
     unique_emoji_map = {}
     for char, eid in all_emojis.items():
         if not char or not eid:
@@ -511,7 +521,7 @@ def apply_premium_emojis(text: str, premium_emojis: dict = None) -> str:
     # Sort by base char length reverse so multi-char emojis match first
     sorted_bases = sorted(unique_emoji_map.items(), key=lambda x: len(x[0]), reverse=True)
 
-    # 3. Replace each emoji safely with placeholder (prevents nested <tg-emoji> tags)
+    # 4. Replace each emoji safely with placeholder (prevents nested <tg-emoji> tags)
     for base_char, emoji_id in sorted_bases:
         if base_char not in protected and (base_char + "\ufe0f") not in protected:
             continue
@@ -526,39 +536,54 @@ def apply_premium_emojis(text: str, premium_emojis: dict = None) -> str:
 
         protected = re.sub(pattern, replace_match, protected)
 
-    # 4. Restore all placeholders in reverse order
+    # 5. Restore all placeholders in reverse order
     for key, val in reversed(list(placeholders.items())):
         protected = protected.replace(key, val)
 
     return protected
 
 def format_button_emoji(btn_text: str, is_reply_keyboard: bool = False, style: str = None, colors_enabled: bool = True, premium_emojis: dict = None) -> tuple:
-    """Processes button text and returns (cleaned_text, api_kwargs)."""
+    """Processes button text and returns (cleaned_text, api_kwargs). Strips HTML & sets custom emoji icon."""
+    if not btn_text or not isinstance(btn_text, str):
+        return "", ({"style": style} if (colors_enabled and style) else None)
+
     all_emojis = get_all_premium_emojis(premium_emojis)
     api_kwargs = {}
 
     if colors_enabled and style:
         api_kwargs["style"] = style
 
-    sorted_emojis = sorted(all_emojis.items(), key=lambda x: len(x[0]), reverse=True)
     found_id = None
     found_char = None
 
-    for char, eid in sorted_emojis:
-        if char in btn_text:
-            found_id = eid
-            found_char = char
-            break
+    # Check if raw <tg-emoji emoji-id="..."> tag is present in btn_text
+    tg_match = re.search(r'<tg-emoji\s+emoji-id=["\'](\d+)["\']>(.*?)</tg-emoji>', btn_text)
+    if tg_match:
+        found_id = tg_match.group(1)
+        found_char = tg_match.group(2)
+        btn_text = re.sub(r'<tg-emoji\s+emoji-id=["\']\d+["\']>(.*?)</tg-emoji>', r'\1', btn_text)
 
-    cleaned_text = btn_text
+    # Strip any remaining HTML tags from button text (Telegram buttons don't support HTML markup!)
+    cleaned_text = re.sub(r'<[^>]+>', '', btn_text).strip()
+
+    if not found_id:
+        sorted_emojis = sorted(all_emojis.items(), key=lambda x: len(x[0]), reverse=True)
+        for char, eid in sorted_emojis:
+            if char in cleaned_text:
+                found_id = eid
+                found_char = char
+                break
+
     if found_id:
         api_kwargs["icon_custom_emoji_id"] = str(found_id)
-        base_char = found_char.replace("\ufe0f", "")
-        cleaned_text = re.sub(re.escape(found_char) + r'\s*', '', cleaned_text)
-        cleaned_text = re.sub(re.escape(base_char) + r'\s*', '', cleaned_text)
-        cleaned_text = cleaned_text.strip()
-        if not cleaned_text:
-            cleaned_text = btn_text
+        if found_char:
+            base_char = found_char.replace("\ufe0f", "")
+            cleaned_text = re.sub(re.escape(found_char) + r'\s*', '', cleaned_text)
+            cleaned_text = re.sub(re.escape(base_char) + r'\s*', '', cleaned_text)
+            cleaned_text = cleaned_text.strip()
+
+    if not cleaned_text:
+        cleaned_text = re.sub(r'<[^>]+>', '', btn_text).strip() or "Button"
 
     return cleaned_text, (api_kwargs if api_kwargs else None)
 
@@ -1008,16 +1033,22 @@ WINGO_STICKERS = {
 
 SURESHOT_APP_URL = "https://t.me/Durov_Jackpot_Bot/abbsy"
 
-def get_sureshot_app_keyboard(premium_emojis: dict = None) -> InlineKeyboardMarkup:
-    """Returns the green button with premium emoji linking to Sureshot App."""
+def get_sureshot_app_keyboard(premium_emojis: dict = None, colors_enabled: bool = True) -> InlineKeyboardMarkup:
+    """Returns the primary button with premium emoji icon linking to Sureshot App cleanly."""
     if premium_emojis is None:
         premium_emojis = {}
-    btn_text = apply_premium_emojis("🔥 OPEN SURESHOT APP 🚀", premium_emojis)
+    btn_text, api_kwargs = format_button_emoji(
+        "🔥 OPEN SURESHOT APP 🚀", 
+        is_reply_keyboard=False, 
+        style="primary", 
+        colors_enabled=colors_enabled, 
+        premium_emojis=premium_emojis
+    )
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(
-            btn_text,
+            text=btn_text,
             url=SURESHOT_APP_URL,
-            api_kwargs={"style": "success"}
+            api_kwargs=api_kwargs
         )]
     ])
 
@@ -1227,7 +1258,8 @@ async def run_wingo_prediction_session(bot, target_chat_id: int, total_rounds: i
     }
 
     premium_emojis = bot_data.get("premium_emojis", {})
-    keyboard = get_sureshot_app_keyboard(premium_emojis)
+    colors_enabled = bot_data.get("colors_enabled", True)
+    keyboard = get_sureshot_app_keyboard(premium_emojis, colors_enabled=colors_enabled)
 
     logger.info("Starting WinGo 1M Prediction Session for chat %s (%d rounds)", target_chat_id, total_rounds)
 
@@ -1414,9 +1446,12 @@ async def run_wingo_prediction_session(bot, target_chat_id: int, total_rounds: i
             logger.warning("Failed to send session_end sticker: %s", e)
 
 async def prompt_wingo_predict_setup(chat_id: int, bot, bot_data: dict, user_id_str: str, message_to_edit=None):
-    """Prompts admin/sub-admin to choose number of prediction rounds."""
+    """Prompts admin/sub-admin to choose number of prediction rounds with premium emoji buttons."""
     bot_data.setdefault("admin_states", {})[user_id_str] = "wingo_await_rounds"
     
+    colors_enabled = bot_data.get("colors_enabled", True)
+    premium_emojis = bot_data.get("premium_emojis", {})
+
     text = (
         f"🔮 <b>WinGo 1M Auto Predictor Setup</b> 🔮\n\n"
         f"🔢 <b>How many predictions do you want to run?</b>\n"
@@ -1424,13 +1459,23 @@ async def prompt_wingo_predict_setup(chat_id: int, bot, bot_data: dict, user_id_
         f"or select a quick option below:\n\n"
         f"⚡ <i>60-second live period interval with official API results & stickers!</i>"
     )
-    formatted = apply_premium_emojis(text, bot_data.get("premium_emojis", {}))
+    formatted = apply_premium_emojis(text, premium_emojis)
+
+    def make_ibtn(raw_text, cb, style="primary"):
+        btn_txt, api_kw = format_button_emoji(
+            raw_text, 
+            is_reply_keyboard=False, 
+            style=style, 
+            colors_enabled=colors_enabled, 
+            premium_emojis=premium_emojis
+        )
+        return InlineKeyboardButton(btn_txt, callback_data=cb, api_kwargs=api_kw)
 
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("5 Rounds 🎯", callback_data="wingo_rounds_5"), InlineKeyboardButton("10 Rounds 🎯", callback_data="wingo_rounds_10")],
-        [InlineKeyboardButton("15 Rounds 🚀", callback_data="wingo_rounds_15"), InlineKeyboardButton("20 Rounds 🚀", callback_data="wingo_rounds_20")],
-        [InlineKeyboardButton("🛑 Stop Active Session", callback_data="wingo_stop", api_kwargs={"style": "danger"})],
-        [InlineKeyboardButton("❌ Cancel", callback_data="adm_close", api_kwargs={"style": "danger"})]
+        [make_ibtn("🎯 5 Rounds", "wingo_rounds_5", "primary"), make_ibtn("🎯 10 Rounds", "wingo_rounds_10", "primary")],
+        [make_ibtn("🚀 15 Rounds", "wingo_rounds_15", "primary"), make_ibtn("🚀 20 Rounds", "wingo_rounds_20", "primary")],
+        [make_ibtn("🛑 Stop Active Session", "wingo_stop", "danger")],
+        [make_ibtn("❌ Cancel", "adm_close", "danger")]
     ])
 
     if message_to_edit:
@@ -1443,18 +1488,30 @@ async def prompt_wingo_predict_setup(chat_id: int, bot, bot_data: dict, user_id_
     await safe_send_message(bot, chat_id=chat_id, text=formatted, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
 async def send_wingo_destination_selector(chat_id: int, bot, bot_data: dict, user_id_str: str, rounds: int, message_to_edit=None):
-    """Allows admin/sub-admin to choose where the predictions should be posted."""
+    """Allows admin/sub-admin to choose where the predictions should be posted with premium emoji buttons."""
     channels = bot_data.get("channels", [])
+    colors_enabled = bot_data.get("colors_enabled", True)
+    premium_emojis = bot_data.get("premium_emojis", {})
+
+    def make_ibtn(raw_text, cb, style="primary"):
+        btn_txt, api_kw = format_button_emoji(
+            raw_text, 
+            is_reply_keyboard=False, 
+            style=style, 
+            colors_enabled=colors_enabled, 
+            premium_emojis=premium_emojis
+        )
+        return InlineKeyboardButton(btn_txt, callback_data=cb, api_kwargs=api_kw)
     
     text = (
         f"🔮 <b>WinGo 1M Predictor ({rounds} Rounds)</b>\n\n"
         f"📍 <b>Where should predictions be posted?</b>\n"
         f"Select the target chat or channel below:"
     )
-    formatted = apply_premium_emojis(text, bot_data.get("premium_emojis", {}))
+    formatted = apply_premium_emojis(text, premium_emojis)
 
     rows = [
-        [InlineKeyboardButton("💬 Send in Current Chat", callback_data=f"wingo_run_{rounds}_chat_{chat_id}")]
+        [make_ibtn("💬 Send in Current Chat", f"wingo_run_{rounds}_chat_{chat_id}", "primary")]
     ]
 
     for c in channels:
@@ -1462,9 +1519,9 @@ async def send_wingo_destination_selector(chat_id: int, bot, bot_data: dict, use
         if len(c_title) > 22:
             c_title = c_title[:20] + ".."
         c_id = c.get("id")
-        rows.append([InlineKeyboardButton(f"📢 {c_title}", callback_data=f"wingo_run_{rounds}_chan_{c_id}")])
+        rows.append([make_ibtn(f"📢 {c_title}", f"wingo_run_{rounds}_chan_{c_id}", "primary")])
 
-    rows.append([InlineKeyboardButton("❌ Cancel", callback_data="adm_close", api_kwargs={"style": "danger"})])
+    rows.append([make_ibtn("❌ Cancel", "adm_close", "danger")])
     keyboard = InlineKeyboardMarkup(rows)
 
     if message_to_edit:
